@@ -1,0 +1,41 @@
+Revision history for Perl extension Devel::Pragma.
+
+0.11  Mon Jun 23 21:03:44 2008
+    - renamed Devel::Pragma
+    - added function: ccstash
+        - added ccstash.t
+    - fixed MANIFEST (thanks Taro Nishino)
+
+0.10  Mon Jun 23 14:40:42 2008
+    - fix bug that was causing my_hints to clobber %^H 
+    - added new_scope function
+    - removed my_hints aliases
+
+0.09  Sat Jun 21 11:06:31 2008
+    - bugfix: return reference to %^H when already in scope
+
+0.08  Sat Jun 21 00:05:44 2008
+    - doc fixlet
+
+0.07  Fri Jun 20 23:47:28 2008
+    - doc fixlet
+
+0.06  Fri Jun 20 20:35:45 2008
+    - my_hh returns a reference to %^H
+    - added another alias: my_hints
+    - future-harden: use the outermost unused PL_hints bit
+
+0.05  Tue Jun 17 23:40:36 2008
+    - lexicalize_hh is now an alias for my_hh
+
+0.04  Tue Jun 17 23:07:09 2008
+    - added dependency on if.pm for perl 5.6.0 and 5.6.1
+
+0.03  Tue Jun 17 21:28:10 2008
+    - added dependency on Test::More for perl 5.6.0 and 5.6.1
+
+0.02  Tue Jun 17 21:15:55 2008
+    - move minimum perl version down from 5.8.0 to 5.6.0 (only tested on 5.6.2)
+
+0.01  Tue Jun 17 20:14:34 2008
+    - original version; created by h2xs 1.23 with options -A -c -n Devel::Hints::Lexical
