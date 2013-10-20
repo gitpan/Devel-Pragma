@@ -2,12 +2,12 @@ package Devel::Pragma;
 
 use 5.008;
 
+# make sure this is loaded first
+use Lexical::SealRequireHints;
+
 use strict;
 use warnings;
 
-our $VERSION = '0.54';
-
-use B::Hooks::EndOfScope;
 use B::Hooks::OP::Annotation;
 use B::Hooks::OP::Check;
 use Carp qw(carp croak);
@@ -16,10 +16,14 @@ use XSLoader;
 
 use base qw(Exporter);
 
-our @EXPORT_OK = qw(my_hints new_scope ccstash scope fqname on_require);
+our $VERSION = '0.60';
+our @EXPORT_OK = qw(my_hints hints new_scope ccstash scope fqname on_require);
 our %EXPORT_TAGS = (all => [ @EXPORT_OK ]);
 
-my $REQUIRE_KEY = 0;
+# Perform (XS) cleanup on global destruction (DESTROY is defined in Pragma.xs).
+# END blocks don't work for this: see https://rt.cpan.org/Ticket/Display.html?id=80400
+# according to perlvar, package variables are garbage collected after END blocks
+our $__GLOBAL_DESTRUCTION_MONITOR__ = bless {};
 
 XSLoader::load(__PACKAGE__, $VERSION);
 
@@ -27,23 +31,17 @@ XSLoader::load(__PACKAGE__, $VERSION);
 sub my_hints() {
     # set HINT_LOCALIZE_HH (0x20000)
     $^H |= 0x20000;
-    my $hints = \%^H;
-
-    unless ($hints->{'Devel::Pragma'}) {
-        $hints->{'Devel::Pragma'} = 1;
-        xs_enter();
-        on_scope_end \&xs_leave;
-    }
-
-    return $hints;
+    return \%^H;
 }
+
+BEGIN { *hints = \&my_hints }
 
 # make sure the "enable lexically-scoped %^H" flag is set (on by default in 5.10)
 sub check_hints() {
     unless ($^H & 0x20000) {
         carp('Devel::Pragma: unexpected $^H (HINT_LOCALIZE_HH bit not set) - setting it now, but results may be unreliable');
     }
-    return my_hints; # create it if it doesn't exist - in some perls, it starts out NULL
+    return hints; # create it if it doesn't exist - in some perls, it starts out NULL
 }
 
 # return a unique integer ID for the current scope
@@ -58,19 +56,19 @@ sub new_scope(;$) {
     my $hints = check_hints();
 
     # this is %^H as an integer - it changes as scopes are entered/exited i.e. it's a unique
-    # identifier for the currently-compiling scope (the scope in which new_scope 
+    # identifier for the currently-compiling scope (the scope in which new_scope
     # is called)
     #
     # we don't need to stack/unstack it in %^H as %^H itself takes care of that
     # note: we need to call this *after* %^H is referenced (and possibly autovivified) above
     #
-    # every time new_scope is called, we write this scope ID to $^H{"Devel::Pragma::Scope::$caller"}.
-    # if $^H{"Devel::Pragma::Scope::$caller"} == scope() (i.e. the stored scope ID is the same as the
+    # every time new_scope is called, we write this scope ID to $^H{"Devel::Pragma::new_scope::$caller"}.
+    # if $^H{"Devel::Pragma::new_scope::$caller"} == scope() (i.e. the stored scope ID is the same as the
     # current scope ID), then we're augmenting the current scope; otherwise we're in a new scope - i.e.
     # a nested or outer scope that didn't previously "use MyPragma"
 
     my $current_scope = scope();
-    my $id = "Devel::Pragma::Scope($caller)";
+    my $id = "Devel::Pragma::new_scope::$caller";
     my $old_scope = exists($hints->{$id}) ? $hints->{$id} : 0;
     my $new_scope; # is this a scope in which new_scope has not previously been called?
 
@@ -117,22 +115,21 @@ sub _pre_require($) {
 
 # run registered callbacks after performing a compile-time require or do FILE
 sub _post_require($) {
-    local $@; # if there was an exception on require, make sure we don't clobber it 
+    local $@; # if there was an exception on require, make sure we don't clobber it
     _callback(1, shift)
 }
 
 # common code for pre- and post-require hooks
-sub _callback($) {
+sub _callback($$) {
     my ($index, $hints) = @_;
+    my $pairs = $hints->{'Devel::Pragma::on_require'} || [];
 
-    if (my $hooks = $hints->{'Devel::Pragma(Hooks)'}) {
-        for my $key (sort(keys(%$hooks))) {
-            eval { $hooks->{$key}->[$index]->($hints) };
+    for my $pair (@$pairs) {
+        eval { $pair->[$index]->($hints) };
 
-            if ($@) {
-                my $stage = $index == 0 ? 'pre' : 'post';
-                carp __PACKAGE__ . ": exception in $stage-require callback: $@";
-            }
+        if ($@) {
+            my $stage = [ qw(pre post) ]->[$index];
+            carp __PACKAGE__ . ": exception in $stage-require callback: $@";
         }
     }
 }
@@ -140,7 +137,7 @@ sub _callback($) {
 # register pre- and/or post-require hooks
 # these are only called if the require occurs at compile-time
 sub on_require($$) {
-    my $hints = my_hints();
+    my $hints = hints();
 
     for my $index (0 .. 1) {
         my $arg = $_[$index];
@@ -150,22 +147,11 @@ sub on_require($$) {
             unless ($arg and _isa($arg, 'CODE'));
     }
 
-    $hints->{'Devel::Pragma(Hooks)'}->{++$REQUIRE_KEY} = [ @_ ];
+    my $old_callbacks = $hints->{'Devel::Pragma::on_require'} || [];
+    $hints->{'Devel::Pragma::on_require'} = [ @$old_callbacks, [ @_ ] ];
 
-    # return $REQUIRE_KEY;
     return;
 }
-
-# sub on_require_remove($) {
-#     my $index = shift;
-#     my $hints = my_hints();
-#     my $hooks = $hints->{'Devel::Pragma(Hooks)'};
-# 
-#     croak(sprintf('%s: attempt to remove a non-existent require hook', __PACKAGE__))
-#         unless ($hooks->{$index});
-# 
-#     delete $hooks->{$index};
-# }
 
 # make sure "enable lexically-scoped %^H" is set in older perls, and export the requested functions
 sub import {
@@ -184,28 +170,28 @@ Devel::Pragma - helper functions for developers of lexical pragmas
 
 =head1 SYNOPSIS
 
-  package MyPragma;
+    package MyPragma;
 
-  use Devel::Pragma qw(:all);
+    use Devel::Pragma qw(:all);
 
-  sub import {
-      my ($class, %options) = @_;
-      my $hints = my_hints;   # lexically-scoped %^H
-      my $caller = ccstash(); # currently-compiling stash
+    sub import {
+        my ($class, %options) = @_;
+        my $hints  = hints;        # lexically-scoped %^H
+        my $caller = ccstash();    # currently-compiling stash
 
-      unless ($hints->{MyPragma}) { # top-level
-           $hints->{MyPragma} = 1;
+        unless ($hints->{MyPragma}) { # top-level
+            $hints->{MyPragma} = 1;
 
-           # disable/enable this pragma before/after compile-time requires
-           on_require \&teardown, \&setup;
-      }
+            # disable/enable this pragma before/after compile-time requires
+            on_require \&teardown, \&setup;
+        }
 
-      if (new_scope($class)) {
-          ...
-      }
+        if (new_scope($class)) {
+            ...
+        }
 
-      my $scope_id = scope();
-  }
+        my $scope_id = scope();
+    }
 
 =head1 DESCRIPTION
 
@@ -219,21 +205,34 @@ C<Devel::Pragma> exports the following functions on demand. They can all be impo
 
     use Devel::Pragma qw(:all);
 
-=head2 my_hints
+=head2 hints
 
-Until perl change #33311, which isn't currently available in any stable
-perl release, values set in %^H are visible in files compiled by C<use>, C<require> and C<do FILE>.
-This makes pragmas leak from the scope in which they're meant to be enabled into scopes in which
-they're not. C<my_hints> fixes that by making %^H lexically scoped i.e. it prevents %^H leaking
-across file boundaries.
+This function enables the scoped behaviour of the hints hash (C<%^H>) and then returns a reference to it.
 
-C<my_hints> installs versions of perl's C<require> and C<do FILE> builtins in the
-currently-compiling scope which clear %^H before they execute and restore its values afterwards.
-Thus it can be thought of a lexically-scoped backport of change #33311.
+The hints hash is a compile-time global variable (which is also available at runtime in recent perls) that
+can be used to implement lexically-scoped features and pragmas. This function provides a convenient
+way to access this hash without the need to perform the bit-twiddling that enables it on older perls.
+In addition, this module loads L<Lexical::SealRequireHints>, which implements bugfixes
+that are required for the correct operation of the hints hash on older perls (< 5.12.0).
 
-Note that C<my_hints> also sets the $^H bit that "localizes" (or in this case "lexicalizes") %^H.
+Typically, C<hints> should be called from a pragma's C<import> (and optionally C<unimport>) method:
 
-The return value is a reference to %^H.
+    package MyPragma;
+
+    use Devel::Pragma qw(hints);
+
+    sub import {
+        my $class = shift;
+        my $hints = hints;
+
+        if ($hints->{MyPragma}) {
+            # ...
+        } else {
+            $hints->{MyPragma} = ...;
+        }
+
+        # ...
+    }
 
 =head2 new_scope
 
@@ -263,7 +262,7 @@ distinguish or compare scopes.
 
 A warning is issued if C<scope> (or C<new_scope>) is called in a context in which it doesn't make sense i.e. if the
 scoped behaviour of C<%^H> has not been enabled - either by explicitly modifying C<$^H>, or by calling
-L<"my_hints"> or L<"on_require">.
+L<"hints"> or L<"on_require">.
 
 =head2 ccstash
 
@@ -363,37 +362,17 @@ These are called whenever C<require> or C<do FILE> OPs are executed at compile-t
 typically via C<use> statements.
 
 C<on_require> takes two callbacks (i.e. anonymous subs or sub references), each of which is called
-with a reference to C<%^H>. The first callback is called before C<require>, and the second is called
-after C<require> has loaded and compiled its file. %^H is cleared before C<require> and restored
-afterwards. (If the file has already been loaded, or the required value is a vstring rather than
-a file name, then both the callbacks and the clearance/restoration of C<%^H> are skipped.)
+with a reference to a copy of C<%^H>. The first callback is called before C<require>, and the second
+is called after C<require> has loaded and compiled its file. If the file has already been loaded,
+or the required value is a vstring rather than a file name, then both the callbacks are skipped.
 
 Multiple callbacks can be registered in a given scope, and they are called in the order in which they
 are registered. Callbacks are unregistered automatically at the end of the (compilation of) the scope
 in which they are registered.
 
-C<on_require> callbacks can be used to disable/re-enable OP check hooks installed via
-L<B::Hooks::OP::Check|B::Hooks::OP::Check> i.e. they can be used to make check hooks
-lexically-scoped.
-
-    package MyPragma;
-
-    use Devel::Pragma qw(:all);
-
-    sub import {
-        my ($class, %args) = @_;
-        my $hints = my_hints;
-
-        unless ($hints->{MyPragma}) { # top-level
-            $hints->{MyPragma} = 1;
-            on_scope_end \&teardown;
-            on_require \&teardown, \&setup;
-            setup;
-        }
-    }
-
-C<on_require> callbacks can also be used to rollback/restore lexical side-effects i.e. lexical features
-whose side-effects extend beyond C<%^H> (like L<"my_hints">, C<on_require> implicitly renders C<%^H> lexically-scoped).
+C<on_require> callbacks can be used to rollback/restore lexical side-effects i.e. lexical features
+whose side-effects extend beyond C<%^H> (like L<"hints">, C<on_require> implicitly enables the scoped
+behaviour of C<%^H>).
 
 Fatal exceptions raised in C<on_require> callbacks are trapped and reported as warnings. If a fatal
 exception is raised in the C<require> or C<do FILE> call, the post-C<require> callbacks are invoked
@@ -401,7 +380,7 @@ before that exception is thrown.
 
 =head1 VERSION
 
-0.54
+0.60
 
 =head1 SEE ALSO
 
@@ -435,7 +414,7 @@ chocolateboy <chocolate@cpan.org>
 
 =head1 COPYRIGHT AND LICENSE
 
-Copyright (C) 2008-2010 by chocolateboy
+Copyright (C) 2008-2013 by chocolateboy
 
 This library is free software; you can redistribute it and/or modify
 it under the same terms as Perl itself, either Perl version 5.8.1 or,
